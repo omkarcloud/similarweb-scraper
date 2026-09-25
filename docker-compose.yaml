@@ -1,0 +1,11 @@
+services:
+  similarweb-scraper:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+      # Recommended for more than a handful of calls: a ROTATING residential
+      # proxy (Similarweb allows ~6 requests per IP).
+      # - SIMILARWEB_PROXY=http://user:pass@host:port
