@@ -1,33 +1,17 @@
 """Value helpers shared by every Similarweb parser: numbers, shares,
 durations, dates, category / country naming, headquarters state codes.
 Pure functions, no network; every helper tolerates None and junk."""
-import html as html_lib
 import re
 
 from similarweb import refdata
+from scraper_utils.values import num, to_int_round as to_int
+from scraper_utils.text import clean as text
 
 SHARE_DIGITS = 4        # 0.3884 = 38.84 %
 METRIC_DIGITS = 2       # pages per visit, prices
 
 
 # ---- numbers ---------------------------------------------------------------------
-
-def num(value):
-    """int / float / numeric string -> float; bool, junk, NaN -> None."""
-    if value is None or isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        return float(value) if value == value else None
-    try:
-        out = float(str(value).strip().replace(",", ""))
-    except ValueError:
-        return None
-    return out if out == out else None
-
-
-def to_int(value):
-    out = num(value)
-    return int(round(out)) if out is not None else None
 
 
 def rounded(value, digits=METRIC_DIGITS):
@@ -70,13 +54,6 @@ def duration_seconds(value):
 
 
 # ---- text / dates -------------------------------------------------------------------
-
-def text(value):
-    """Whitespace-collapsed, HTML-unescaped string; '' -> None."""
-    if value is None:
-        return None
-    out = " ".join(html_lib.unescape(str(value)).replace("\xa0", " ").split())
-    return out or None
 
 
 def iso_date(value):

@@ -44,3 +44,13 @@ def similarweb_similarsites_proxy():
     """similarsites.com has no firewall: direct first (SIMILARWEB_PROXY is
     the retry)."""
     return None
+
+
+# ---- added by the sync: defaults for a direct run ----
+SIMILARWEB_GATEWAY_ATTEMPTS = 2
+SIMILARWEB_GATEWAY_FAILURES = 3
+SIMILARWEB_GATEWAY_PAUSE = 120
+SIMILARWEB_TOKEN_CALLS = 3
+def burst_slots(share):
+    return share
+

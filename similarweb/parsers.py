@@ -36,16 +36,9 @@ Fields intentionally NOT exposed (and why):
 """
 from similarweb import refs
 from similarweb import shared as S
+from scraper_utils.values import as_dict as _dict, as_list as _list
 
 # ---- building blocks ------------------------------------------------------------------
-
-
-def _list(value):
-    return value if isinstance(value, list) else []
-
-
-def _dict(value):
-    return value if isinstance(value, dict) else {}
 
 
 def website_ref(domain, icon=None):

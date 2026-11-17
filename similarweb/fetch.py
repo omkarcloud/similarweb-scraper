@@ -1,5 +1,6 @@
-"""Similarweb transport: plain curl_cffi (Chrome TLS) through rotating
-residential exits, with a headful patchright load as the last resort.
+"""Similarweb transport: plain curl_cffi (Chrome TLS) through the gateway exit
+first, then rotating residential exits, with a token minted by a headful
+Chrome on the browser box as the last resort.
 
 Surfaces (all logged-out, validated 2026-09-25):
 
@@ -24,20 +25,42 @@ AWS WAF (CloudFront) sits in front of www.similarweb.com:
 So each call takes an exit from a small shared pool of sticky residential
 ports, and an exit is retired after config.SIMILARWEB_REQUESTS_PER_EXIT
 calls or on its first 202 / 403 / 405. A call is retried on fresh exits up
-to config.SIMILARWEB_MAX_ATTEMPTS times; when every attempt was challenged,
-one headful patchright Chrome on a fresh exit solves the challenge on an
-open page and repeats the call as an in-page fetch.
+to config.SIMILARWEB_MAX_ATTEMPTS times.
+
+Since 2026-11-11 a call first tries the shared gateway exit
+(config.SIMILARWEB_GATEWAY_EXIT = "gateway", _via_gateway: a fresh gateway address
+per request, sent stateless because the site's rate rule counts its `sgID`
+cookie); the pool above is what a call falls back to when the gateway is
+challenged, rate-limited or down, and while it is paused after
+config.SIMILARWEB_GATEWAY_FAILURES failed calls in a row.
+
+When every attempt was challenged (the empty cookie stops passing in
+bursts: 1,480 of 1,505 attempts on 2026-10-23), the browser box MINTS a real
+token (recipes/similarweb.py) on an exit the WAF challenged with a 202, and
+the call is replayed over curl with it on that same exit. Measured
+2026-10-24: the token works only from the IP that earned it (405 from any
+other exit), and the per-IP rule still applies with it — about 3 API calls
+after the mint, then 429, then a hard 403 for hours — whether the calls are
+curl replays or in-page fetches from the minting browser. So the box never
+serves calls: a minted identity serves config.SIMILARWEB_TOKEN_CALLS calls
+over curl within the recipe's ttl, later calls use it before spending fresh
+exits, and any block retires it. The identity lives in an identity_pool.Pool
+(shared mode, one per process, the use budget charged when a call takes
+it), so concurrent failing calls share one mint instead of minting one
+each. Until then the fallback was one new Chrome per call running the call
+as an in-page fetch.
 
 Not usable: data.similarweb.com/api/v1/data (the legacy extension JSON)
 answers 403 to curl and to a real Chrome from every exit tried.
 
 Failure taxonomy (scraper_errors, mapped to HTTP by route_glue):
   SimilarwebUpstreamError  transport failure / 5xx / unexpected body — retryable
-  SimilarwebBlocked        WAF challenge / block on every exit        — retryable
+  SimilarwebBlocked        WAF challenge / block on every exit — retryable
   SimilarwebBadRequest     upstream 400 (unknown filter combination)  — never retried
   SimilarwebNotFound       upstream 404 / "We Have No Data" page      — never retried
 """
 import json
+import fastjson
 import os
 import sys
 import threading
@@ -47,26 +70,27 @@ from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import browser_client
 import config
+import egress
+import identity_pool
 from scraper_errors import BadRequest, Blocked, NotFound, UpstreamError
+from scraper_utils import debug, fanout, memo, sessions
 
 SITE = "https://www.similarweb.com"
 SIMILARSITES = "https://www.similarsites.com"
 IMPERSONATE = "chrome"
 TIMEOUT = (10, 35)          # (connect, read): a dead exit fails fast
 
-JSON_HEADERS = {"accept": "application/json, text/plain, */*", "accept-language": "en-US,en;q=0.9",
+JSON_HEADERS = {"accept": "application/json, text/plain, */*",
                 "referer": SITE + "/"}
-PAGE_HEADERS = {"accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "accept-language": "en-US,en;q=0.9"}
+PAGE_HEADERS = {"accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}
 # The whole bypass: an empty token cookie is not challenged, a missing one is.
 WAF_COOKIES = {"aws-waf-token": ""}
 
 STATE_ANCHOR = "window.__APP_DATA__"
 NO_DATA_MARKER = "<title>We Have No Data"
 BLOCK_STATUSES = (202, 403, 405)
-BROWSER_WARMUP_PATH = "/top-websites/"      # an open page to clear the challenge on
-BROWSER_SETTLE_TIMEOUT = 25
 
 
 class SimilarwebUpstreamError(UpstreamError):
@@ -87,14 +111,7 @@ class SimilarwebNotFound(NotFound):
 
 def dump_debug(name, text):
     """Write a raw response to $SIMILARWEB_DEBUG_DIR/<name>.txt."""
-    dbg = os.environ.get("SIMILARWEB_DEBUG_DIR", "")
-    if dbg and text:
-        try:
-            os.makedirs(dbg, exist_ok=True)
-            with open(os.path.join(dbg, name + ".txt"), "w") as f:
-                f.write(text)
-        except OSError:
-            pass
+    debug.dump("SIMILARWEB_DEBUG_DIR", name, text)
 
 
 # ---- exit pool ---------------------------------------------------------------------
@@ -152,10 +169,7 @@ def _retire(ex):
 
 
 def _sessions():
-    store = getattr(_local, "sessions", None)
-    if store is None:
-        store = _local.sessions = OrderedDict()
-    return store
+    return sessions.thread_store(_local)
 
 
 def _session(ex):
@@ -166,6 +180,7 @@ def _session(ex):
     sess = store.get(key)
     if sess is None:
         sess = curl_requests.Session(impersonate=IMPERSONATE)
+        sess.headers["accept-language"] = egress.accept_language(proxy)
         if proxy:
             sess.proxies = {"http": proxy, "https": proxy}
         store[key] = sess
@@ -181,12 +196,7 @@ def _session(ex):
 
 
 def _drop_session(key):
-    sess = _sessions().pop(key, None)
-    if sess is not None:
-        try:
-            sess.close()
-        except Exception:
-            pass
+    sessions.drop_keyed(_sessions(), key)
 
 
 # ---- classification ------------------------------------------------------------------
@@ -208,55 +218,184 @@ def classify(status, text, label):
     return text
 
 
-def _curl_once(url, headers, label, fresh):
-    ex = _take_exit(fresh=fresh)
+def _curl_once(url, headers, label, fresh, cookies=None, ex=None):
+    """One GET through `ex` (default: an exit from the pool). A block
+    retires the exit and carries it (`.exit`) and the status (`.status`),
+    so the caller can mint on an exit the WAF merely challenged."""
+    ex = ex or _take_exit(fresh=fresh)
     sess = _session(ex)
     try:
-        resp = sess.get(url, headers=headers, cookies=WAF_COOKIES, timeout=TIMEOUT, allow_redirects=True)
+        resp = sess.get(url, headers=headers, cookies=WAF_COOKIES if cookies is None else cookies,
+                        timeout=TIMEOUT, allow_redirects=True)
     except Exception as e:
         _retire(ex)
         raise SimilarwebUpstreamError(f"request failed on {label}: {type(e).__name__}: {e}")
     try:
         return classify(resp.status_code, resp.text, label)
-    except SimilarwebBlocked:
+    except SimilarwebBlocked as e:
         _retire(ex)
+        e.exit, e.status = ex, resp.status_code
         raise
 
 
-# ---- browser fallback ----------------------------------------------------------------
+# ---- the gateway exit (in front of the exit pool) --------------------------------
+# config.SIMILARWEB_GATEWAY_EXIT = "gateway": a call is tried through the shared
+# gateway exit (exit_gateway.py, a fresh gateway address per request) before it
+# spends a residential exit. Measured 2026-11-11 through the gateway: the
+# empty `aws-waf-token=` cookie passes there too (no cookie: 202
+# x-amzn-waf-action: challenge), and the site's own rate rule counts the
+# `sgID` cookie its first answer sets, not the address: with that cookie kept
+# the 4th request is a 429 "Rate limit exceeded" (44 bytes) whether the
+# X-Forwarded-For is fixed or random; with no cookie sent back 12 of 12
+# passed on ONE fixed X-Forwarded-For. So every gateway request is
+# stateless: the session's jar is emptied first and nothing but the empty
+# token cookie is sent.
+GATEWAY_COOKIE = "; ".join(f"{name}={value}" for name, value in WAF_COOKIES.items())
+_gateway_lock = threading.Lock()
+_gateway_state = {"failed": 0, "paused_until": 0.0}     # calls in a row the gateway could not serve
 
-_browser_slots = threading.BoundedSemaphore(max(1, int(config.SIMILARWEB_BROWSER_CONCURRENCY)))
+
+def _gateway_exit():
+    """'gateway' when the config names the gateway, else None (a config without
+    the knob, the open-source kit's, has no gateway)."""
+    exit_for = getattr(config, "similarweb_gateway_exit", None)
+    return exit_for() if exit_for else None
 
 
-def _browser_get(url, headers, label):
-    """One headful patchright Chrome on a fresh exit: load an open page (the
-    WAF challenge.js runs and mints a real token), then GET `url` as an
-    in-page fetch with that token. Returns the body text."""
-    from chrome_manager import create_scope
-    from patchright_driver import PatchrightDriver
+def _gateway_attempts():
+    """How many gateway tries a call gets now: 0 with no gateway configured
+    or while it is paused (config.SIMILARWEB_GATEWAY_FAILURES calls in a row
+    it could not serve -> skipped for config.SIMILARWEB_GATEWAY_PAUSE s: the
+    WAF's challenge-everything bursts hit every address alike)."""
+    if not _gateway_exit() or time.monotonic() < _gateway_state["paused_until"]:
+        return 0
+    return max(1, int(config.SIMILARWEB_GATEWAY_ATTEMPTS))
 
-    driver = None
-    with _browser_slots:
+
+def _note_gateway(served):
+    with _gateway_lock:
+        if served:
+            _gateway_state["failed"] = 0
+            return
+        _gateway_state["failed"] += 1
+        if _gateway_state["failed"] >= max(1, int(config.SIMILARWEB_GATEWAY_FAILURES)):
+            _gateway_state["failed"] = 0
+            _gateway_state["paused_until"] = time.monotonic() + float(config.SIMILARWEB_GATEWAY_PAUSE)
+            print(f"similarweb: the gateway exit failed {config.SIMILARWEB_GATEWAY_FAILURES} calls in a row; "
+                  f"residential exits only for {config.SIMILARWEB_GATEWAY_PAUSE} s")
+
+
+def _gateway_session():
+    """The calling thread's session on the gateway exit (it keeps the
+    connection to the gateway; the address the site sees changes per request)."""
+    exit = _gateway_exit()
+    sess = getattr(_local, "gateway", None)
+    if sess is None or getattr(_local, "gateway_exit", None) != exit:
+        sess = egress.new_session(exit, impersonate=IMPERSONATE)
+        sess.headers["accept-language"] = egress.accept_language(exit)
+        _local.gateway, _local.gateway_exit = sess, exit
+    return sess
+
+
+def _gateway_once(url, headers, label):
+    """One stateless GET through the gateway exit -> body text (classify's
+    errors; a transport failure drops the thread's gateway session)."""
+    sess = _gateway_session()
+    try:
+        sess.cookies.clear()                    # never the sgID of an earlier answer: the rate rule counts it
+        # the Cookie header, not cookies=: on a gateway session that kwarg
+        # would be curl's cookie for the hop to the gateway
+        resp = sess.get(url, headers=dict(headers, cookie=GATEWAY_COOKIE), timeout=TIMEOUT, allow_redirects=True)
+    except Exception as e:
+        _local.gateway = None
         try:
-            with create_scope():
-                driver = PatchrightDriver(proxy_url=config.similarweb_proxy(), headless=False)
-            driver.nav(SITE + BROWSER_WARMUP_PATH, mode="blocked", challenge_markers=("gokuProps",))
-            deadline = time.monotonic() + BROWSER_SETTLE_TIMEOUT
-            while time.monotonic() < deadline:
-                if any(c.get("name") == "aws-waf-token" and c.get("value") for c in driver.cookies()):
-                    break
-                time.sleep(1.0)
-            resp = driver.get(url, headers={k: v for k, v in headers.items() if k != "referer"},
-                              referrer=SITE + "/")
-            if resp.error and not resp.status_code:
-                raise SimilarwebUpstreamError(f"browser fetch failed on {label}: {resp.error}")
-            return classify(resp.status_code, resp.text, label)
-        finally:
-            if driver is not None:
-                try:
-                    driver.close()
-                except Exception:
-                    pass
+            sess.close()
+        except Exception:
+            pass
+        raise SimilarwebUpstreamError(f"request failed on {label}: {type(e).__name__}: {e}")
+    return classify(resp.status_code, resp.text, label)
+
+
+def _via_gateway(url, headers, label):
+    """The call through the gateway exit, up to _gateway_attempts() tries:
+    (True, text) when it answered, (False, None) when the residential exits
+    are next. NotFound / BadRequest are the site's answer and propagate."""
+    attempts = _gateway_attempts()
+    if not attempts:
+        return False, None
+    for attempt in range(1, attempts + 1):
+        try:
+            text = _gateway_once(url, headers, label)
+        except (SimilarwebNotFound, SimilarwebBadRequest):
+            _note_gateway(True)
+            raise
+        except SimilarwebUpstreamError as e:
+            print(f"similarweb: gateway exit attempt {attempt}/{attempts} on {label} failed: {e}")
+            continue
+        _note_gateway(True)
+        return True, text
+    _note_gateway(False)
+    return False, None
+
+
+# ---- minted identities (the fallback, on the browser box) ----------------------
+# A token minted by the box (recipes/similarweb.py) on one exit, replayed over
+# curl on that same exit (the token is IP-bound). One process-wide identity
+# in an identity_pool.Pool: `value` is the token, `exit` the _Exit it was
+# minted on; the pool charges one of its SIMILARWEB_TOKEN_CALLS uses per
+# call that takes it and retires it when spent, at the recipe's expires_at
+# or on its first block (retire). Nothing is minted until a call's curl
+# attempts all failed (get_text), and then once per process, not per call.
+
+def _mint(key, hint):
+    """The pool's mint function: the box earns a token on `hint` (the _Exit
+    the WAF challenged, or a fresh one). Box errors propagate (the pool never
+    catches; _mint_identity maps them); a box answer without a token is a
+    BoxRefused."""
+    ex = hint if hint is not None else _Exit(config.similarweb_proxy())
+    minted = browser_client.mint("similarweb", proxy=ex.proxy)
+    token = (minted.get("tokens") or {}).get("aws-waf-token")
+    if not token:
+        raise browser_client.BoxRefused("the box returned no aws-waf-token")
+    return identity_pool.Identity(token, exit=ex, expires_at=float(minted.get("expires_at") or time.time() + 240))
+
+
+_identities = identity_pool.Pool("similarweb", _mint, budget=lambda: max(1, int(config.SIMILARWEB_TOKEN_CALLS)),
+                                 mints_per_minute=5)
+
+
+def _take_identity():
+    """The live minted identity, with one call charged on it, or None (no
+    mint here: a token is minted only after a call's curl attempts failed)."""
+    return _identities.get(mint=False)
+
+
+def _mint_identity(ex, label):
+    """The pooled identity, minted on `ex` if the pool has none (a mint in
+    flight is shared, not repeated); this call is charged on it."""
+    try:
+        return _identities.get(hint=ex)
+    except browser_client.BoxRefused as e:
+        raise SimilarwebBlocked(f"{label}: the browser box could not earn a token on this exit: {e}") from e
+    except browser_client.BoxUnavailable as e:
+        raise SimilarwebUpstreamError(f"{label}: browser box unavailable: {e}") from e
+    except (browser_client.RemintBudgetExceeded, identity_pool.MintBudgetExceeded) as e:
+        raise SimilarwebBlocked(f"{label}: token mints paused ({e})") from e
+
+
+def _replay(ident, url, headers, label):
+    """The call over curl with the identity's token on its own exit; a block
+    or a transport failure retires the identity (a no-op when another
+    thread already did)."""
+    try:
+        return _curl_once(url, headers, label, fresh=False, cookies={"aws-waf-token": ident.value}, ex=ident.exit)
+    except (SimilarwebBlocked, SimilarwebUpstreamError):
+        _identities.retire(ident)
+        raise
+
+
+def _exit_label(ex):
+    return f"exit port {ex.proxy.rsplit(':', 1)[-1]}" if ex and ex.proxy else "direct egress"
 
 
 # ---- public fetchers -------------------------------------------------------------------
@@ -268,14 +407,29 @@ def get_text(path, params=None, headers=None, label=None):
     url = SITE + path + (("?" + urlencode(query)) if query else "")
     label = label or path
     headers = headers or JSON_HEADERS
+    ident = _take_identity()
+    if ident is not None:
+        # a token minted for an earlier call still has calls left on its exit
+        try:
+            return _replay(ident, url, headers, label)
+        except (SimilarwebNotFound, SimilarwebBadRequest):
+            raise
+        except (SimilarwebBlocked, SimilarwebUpstreamError) as e:
+            print(f"similarweb: minted token on {_exit_label(ident.exit)} failed on {label}: {e}; retired")
+    served, text = _via_gateway(url, headers, label)
+    if served:
+        return text
     last = None
     blocked_only = True
+    challenged = None           # the first exit the WAF only challenged (202): the one worth a mint
     attempts = max(1, int(config.SIMILARWEB_MAX_ATTEMPTS))
     for attempt in range(1, attempts + 1):
         try:
             return _curl_once(url, headers, label, fresh=attempt > 1)
         except SimilarwebBlocked as e:
             last = e
+            if challenged is None and getattr(e, "status", None) == 202:
+                challenged = e.exit
         except SimilarwebUpstreamError as e:
             last = e
             blocked_only = False
@@ -283,14 +437,16 @@ def get_text(path, params=None, headers=None, label=None):
         if attempt < attempts:
             time.sleep(0.3 * attempt)
     if blocked_only and config.SIMILARWEB_BROWSER_FALLBACK:
-        print(f"similarweb: every curl attempt on {label} was challenged; trying a browser")
+        # no exit was merely challenged (all hard-blocked / CAPTCHA'd): mint on a fresh one
+        ex = challenged or _Exit(config.similarweb_proxy())
+        print(f"similarweb: every curl attempt on {label} was challenged; minting a token on {_exit_label(ex)}")
         try:
-            return _browser_get(url, headers, label)
+            return _replay(_mint_identity(ex, label), url, headers, label)
         except (SimilarwebNotFound, SimilarwebBadRequest):
             raise
         except Exception as e:
-            print(f"similarweb: browser fallback failed on {label}: {type(e).__name__}: {e}")
-            raise SimilarwebBlocked(f"{label}: challenged on {attempts} exits and in a browser") from e
+            print(f"similarweb: minted-token fallback failed on {label}: {type(e).__name__}: {e}")
+            raise SimilarwebBlocked(f"{label}: challenged on {attempts} exits and with a minted token") from e
     raise last
 
 
@@ -299,7 +455,7 @@ def api_json(path, params=None, label=None):
     label = label or path
     text = get_text(path, params, headers=JSON_HEADERS, label=label)
     try:
-        return json.loads(text) if text.strip() else None
+        return fastjson.loads(text) if text.strip() else None
     except ValueError:
         dump_debug("non_json", text)
         raise SimilarwebUpstreamError(f"non-JSON body on {label}")
@@ -360,7 +516,7 @@ def similarsites(domain):
         if not text.strip() or text.strip() in ("null", "{}"):
             raise SimilarwebNotFound(f"similarsites.com has no data for {domain}")
         try:
-            return json.loads(text)
+            return fastjson.loads(text)
         except ValueError:
             last = SimilarwebUpstreamError(f"non-JSON body on {label}")
     raise last
@@ -377,19 +533,7 @@ MEMO_MAX = 256
 
 
 def memoized(key, fn, ttl=MEMO_TTL):
-    now = time.monotonic()
-    with _memo_lock:
-        hit = _memo.get(key)
-        if hit and now - hit[0] < ttl:
-            _memo.move_to_end(key)
-            return hit[1]
-    value = fn()
-    with _memo_lock:
-        _memo[key] = (now, value)
-        _memo.move_to_end(key)
-        while len(_memo) > MEMO_MAX:
-            _memo.popitem(last=False)
-    return value
+    return memo.memoized(_memo, _memo_lock, MEMO_MAX, key, fn, ttl)
 
 
 def shared_raw(name, params, build, ttl):
@@ -405,15 +549,7 @@ def shared_raw(name, params, build, ttl):
 def run_parallel(fns, workers):
     """Run zero-arg callables in parallel; results align with `fns`. Each
     result is ("ok", value) or ("error", exception)."""
-    def guard(fn):
-        try:
-            return ("ok", fn())
-        except Exception as e:
-            return ("error", e)
-    if not fns:
-        return []
-    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(fns)))) as ex:
-        return list(ex.map(guard, fns))
+    return fanout.guarded_per_call(fns, workers)
 
 
 if __name__ == "__main__":
